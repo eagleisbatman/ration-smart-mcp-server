@@ -22,10 +22,13 @@ This MCP (Model Context Protocol) server provides dairy cattle nutrition optimiz
 - ✅ 4 MCP tools for comprehensive feed analysis
 - ✅ API Key authentication (recommended for organizations)
 - ✅ Email + PIN authentication (backward compatible)
+- ✅ **Auto-detection of country_id from feeds** - No need to specify country explicitly
+- ✅ **Automatic user_id handling** - Service account used for API key auth
 - ✅ User ID caching for performance
-- ✅ Comprehensive error handling
+- ✅ Comprehensive error handling with helpful suggestions
 - ✅ TypeScript with full type safety
 - ✅ StreamableHTTP transport for MCP
+- ✅ Unit and integration tests
 
 ## 📦 Installation
 
@@ -61,6 +64,7 @@ ALLOWED_ORIGINS=*
 - `FEED_API_EMAIL` must be a valid email address, not a phone number
 - API Key authentication is recommended for production use
 - Get API keys from the [Admin Dashboard](https://github.com/eagleisbatman/ration-smart-feed-library)
+- **Note:** `FEED_API_USER_ID` and `FEED_API_COUNTRY_ID` are optional - the server auto-detects country from feeds and uses a service account for user_id
 
 ## 🚀 Development
 
@@ -76,6 +80,27 @@ npm run build
 
 # Start production server
 npm start
+
+# Run tests
+npm test
+
+# Run tests in watch mode
+npm run test:watch
+
+# Run tests with coverage
+npm run test:coverage
+```
+
+## 🧪 Testing
+
+See [README_TESTS.md](./README_TESTS.md) for detailed testing guide.
+
+```bash
+# Run unit tests
+npm test
+
+# Run with coverage
+npm run test:coverage
 ```
 
 ## 🔧 MCP Tools
@@ -85,7 +110,11 @@ Analyze an existing diet for nutritional adequacy.
 
 **Parameters:**
 - `cattle_info`: Cattle information (weight, milk production, etc.)
-- `feed_evaluation`: List of feeds with quantities
+- `feed_evaluation`: List of feeds with quantities and prices
+
+**Auto-detection:**
+- `country_id` is automatically detected from the feeds provided
+- `user_id` is automatically handled via service account
 
 **Returns:** Comprehensive diet analysis including nutritional values, deficiencies, and recommendations.
 
@@ -94,7 +123,11 @@ Generate an optimized least-cost diet plan.
 
 **Parameters:**
 - `cattle_info`: Cattle information
-- `feed_selection`: Available feeds with prices
+- `feed_selection`: Available feeds with prices (6-10 feeds, mix of forage and concentrate)
+
+**Auto-detection:**
+- `country_id` is automatically detected from the feeds provided
+- `user_id` is automatically handled via service account
 
 **Returns:** Optimized diet plan with feed quantities and costs.
 

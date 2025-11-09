@@ -18,29 +18,69 @@ app.use(cors({
 
 // Environment variables
 const FEED_API_BASE_URL = process.env.FEED_API_BASE_URL || 'http://47.128.1.51:8000';
-const FEED_API_KEY = process.env.FEED_API_KEY || ''; // API key (recommended for organizations)
-const FEED_API_EMAIL = process.env.FEED_API_EMAIL || ''; // Email address (alternative to API key)
-const FEED_API_PIN = process.env.FEED_API_PIN || ''; // 4-digit PIN (required if using email)
+// Legacy support: fallback credentials for backward compatibility (not recommended)
+const FEED_API_KEY = process.env.FEED_API_KEY || ''; // Fallback API key (deprecated - use request headers)
+const FEED_API_EMAIL = process.env.FEED_API_EMAIL || ''; // Fallback email (deprecated)
+const FEED_API_PIN = process.env.FEED_API_PIN || ''; // Fallback PIN (deprecated)
 const FEED_API_USER_ID = process.env.FEED_API_USER_ID || ''; // Service account user ID (for API key auth)
 const FEED_API_COUNTRY_ID = process.env.FEED_API_COUNTRY_ID || ''; // Default country ID (for API key auth)
 const PORT = process.env.PORT || 3005;
 
-// Warn if credentials are missing
-if (!FEED_API_KEY && (!FEED_API_EMAIL || !FEED_API_PIN)) {
-  console.warn('⚠️  WARNING: Authentication credentials are not set!');
-  console.warn('⚠️  Use either FEED_API_KEY (recommended) or FEED_API_EMAIL + FEED_API_PIN');
-  console.warn('⚠️  Server will start but MCP tools will not work until credentials are configured.');
+/**
+ * Extract API key from request headers
+ * Supports: Authorization: Bearer <api_key>
+ */
+function extractApiKeyFromRequest(req: express.Request): string | null {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    return null;
+  }
+  
+  // Support both "Bearer <key>" and just "<key>"
+  if (authHeader.startsWith('Bearer ')) {
+    return authHeader.substring(7).trim();
+  }
+  
+  return authHeader.trim();
 }
 
-// Initialize Feed Formulation Client
-const feedClient = (FEED_API_KEY || (FEED_API_EMAIL && FEED_API_PIN))
-  ? new FeedFormulationClient(
-      FEED_API_BASE_URL,
-      FEED_API_KEY || undefined,
-      FEED_API_EMAIL || undefined,
-      FEED_API_PIN || undefined
-    )
-  : null;
+/**
+ * Create FeedFormulationClient from request or fallback to env vars
+ */
+function createFeedClient(req: express.Request): FeedFormulationClient | null {
+  // Priority 1: Extract API key from request headers (recommended)
+  const apiKey = extractApiKeyFromRequest(req);
+  if (apiKey) {
+    try {
+      return new FeedFormulationClient(FEED_API_BASE_URL, apiKey);
+    } catch (error) {
+      console.error('[MCP] Error creating feed client with API key from request:', error);
+      return null;
+    }
+  }
+  
+  // Priority 2: Fallback to environment variables (legacy support)
+  if (FEED_API_KEY) {
+    try {
+      return new FeedFormulationClient(FEED_API_BASE_URL, FEED_API_KEY);
+    } catch (error) {
+      console.error('[MCP] Error creating feed client with env API key:', error);
+      return null;
+    }
+  }
+  
+  // Priority 3: Email+PIN fallback (legacy support)
+  if (FEED_API_EMAIL && FEED_API_PIN) {
+    try {
+      return new FeedFormulationClient(FEED_API_BASE_URL, undefined, FEED_API_EMAIL, FEED_API_PIN);
+    } catch (error) {
+      console.error('[MCP] Error creating feed client with email+PIN:', error);
+      return null;
+    }
+  }
+  
+  return null;
+}
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -49,7 +89,8 @@ app.get('/health', (req, res) => {
     service: 'ration-smart-mcp-server',
     timestamp: new Date().toISOString(),
     version: '1.0.0',
-    apiConfigured: !!feedClient
+    authentication: 'API key via Authorization header (Bearer token) or legacy env vars',
+    baseUrl: FEED_API_BASE_URL
   });
 });
 
@@ -75,6 +116,9 @@ app.get('/', (req, res) => {
 // Main MCP endpoint
 app.post('/mcp', async (req, res) => {
   try {
+    // Extract API key from request and create feed client
+    const feedClient = createFeedClient(req);
+    
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined // Stateless
     });
@@ -91,13 +135,13 @@ app.post('/mcp', async (req, res) => {
         'Server not configured - missing credentials',
         {},
         async () => {
-          return {
-            content: [{
-              type: 'text',
-              text: 'Ration Smart API credentials not configured. Please set FEED_API_KEY (recommended) or FEED_API_EMAIL and FEED_API_PIN environment variables.'
-            }],
-            isError: true
-          };
+            return {
+              content: [{
+                type: 'text',
+                text: 'Ration Smart API credentials not configured. Please provide an API key in the Authorization header (Authorization: Bearer <api_key>) or set FEED_API_KEY environment variable for legacy support.'
+              }],
+              isError: true
+            };
         }
       );
     } else {
@@ -149,12 +193,13 @@ app.post('/mcp', async (req, res) => {
               price_per_kg: f.price_per_kg
             }));
 
+            // Auto-detect country_id from feeds (no need to pass explicitly)
             const result = await feedClient!.evaluateDiet(
               cattleInfo,
               feedEvaluation,
-              FEED_API_COUNTRY_ID || undefined, // countryId - use env var or cached
-              undefined, // currency - will use cached or default
-              FEED_API_USER_ID || undefined // userId for API key auth
+              undefined, // countryId - auto-detected from feeds
+              undefined, // currency - will use default (USD) or detect from country
+              undefined // userId - uses service account for API key auth
             );
 
             return {
@@ -165,10 +210,21 @@ app.post('/mcp', async (req, res) => {
             };
           } catch (error: any) {
             console.error('[MCP Tool] Error in evaluate_diet:', error);
+            const errorMessage = error.message || 'Unknown error occurred';
+            const errorDetails = error.response?.data?.detail || error.response?.data?.message || '';
             return {
               content: [{
                 type: 'text',
-                text: `Failed to evaluate diet: ${error.message}`
+                text: JSON.stringify({
+                  error: 'Diet evaluation failed',
+                  message: errorMessage,
+                  details: errorDetails || undefined,
+                  suggestion: errorMessage.includes('country_id') 
+                    ? 'Ensure feeds have country_id set or provide country_id explicitly'
+                    : errorMessage.includes('user_id')
+                    ? 'User ID is automatically handled - this error should not occur'
+                    : 'Check feed IDs are valid and API credentials are correct'
+                }, null, 2)
               }],
               isError: true
             };
@@ -222,10 +278,12 @@ app.post('/mcp', async (req, res) => {
               price_per_kg: f.price_per_kg
             }));
 
+            // Auto-detect country_id from feeds (no need to pass explicitly)
             const result = await feedClient!.getDietRecommendation(
               cattleInfo,
               feedSelection,
-              FEED_API_USER_ID || undefined // userId for API key auth
+              undefined, // countryId - auto-detected from feeds
+              undefined // userId - uses service account for API key auth
             );
 
             return {
@@ -236,10 +294,21 @@ app.post('/mcp', async (req, res) => {
             };
           } catch (error: any) {
             console.error('[MCP Tool] Error in get_diet_recommendation:', error);
+            const errorMessage = error.message || 'Unknown error occurred';
+            const errorDetails = error.response?.data?.detail || error.response?.data?.message || '';
             return {
               content: [{
                 type: 'text',
-                text: `Failed to get diet recommendation: ${error.message}`
+                text: JSON.stringify({
+                  error: 'Diet recommendation failed',
+                  message: errorMessage,
+                  details: errorDetails || undefined,
+                  suggestion: errorMessage.includes('country_id')
+                    ? 'Ensure feeds have country_id set or provide country_id explicitly'
+                    : errorMessage.includes('6-10 feeds')
+                    ? 'Provide 6-10 feeds with a mix of forage and concentrate types'
+                    : 'Check feed IDs are valid, prices are provided, and API credentials are correct'
+                }, null, 2)
               }],
               isError: true
             };
@@ -265,10 +334,19 @@ app.post('/mcp', async (req, res) => {
             };
           } catch (error: any) {
             console.error('[MCP Tool] Error in get_feed_info:', error);
+            const errorMessage = error.message || 'Unknown error occurred';
+            const errorDetails = error.response?.data?.detail || error.response?.data?.message || '';
             return {
               content: [{
                 type: 'text',
-                text: `Failed to get feed info: ${error.message}`
+                text: JSON.stringify({
+                  error: 'Failed to get feed information',
+                  message: errorMessage,
+                  details: errorDetails || undefined,
+                  suggestion: errorMessage.includes('404') || errorMessage.includes('not found')
+                    ? 'Verify the feed_id is correct and the feed exists in the database'
+                    : 'Check API credentials and network connectivity'
+                }, null, 2)
               }],
               isError: true
             };
@@ -308,10 +386,17 @@ app.post('/mcp', async (req, res) => {
             };
           } catch (error: any) {
             console.error('[MCP Tool] Error in search_feeds:', error);
+            const errorMessage = error.message || 'Unknown error occurred';
+            const errorDetails = error.response?.data?.detail || error.response?.data?.message || '';
             return {
               content: [{
                 type: 'text',
-                text: `Failed to search feeds: ${error.message}`
+                text: JSON.stringify({
+                  error: 'Feed search failed',
+                  message: errorMessage,
+                  details: errorDetails || undefined,
+                  suggestion: 'Check filter parameters (country_id, feed_type, feed_category) are valid UUIDs or enum values'
+                }, null, 2)
               }],
               isError: true
             };
@@ -349,7 +434,8 @@ const server = app.listen(Number(PORT), HOST, () => {
   console.log(`✅ Server running on ${HOST}:${PORT}`);
   console.log(`📍 Health check: http://localhost:${PORT}/health`);
   console.log(`🌾 MCP endpoint: http://localhost:${PORT}/mcp`);
-  console.log(`🔑 API Credentials: ${feedClient ? '✅ Configured' : '⚠️  NOT CONFIGURED'}`);
+  console.log(`🔑 Authentication: API key via Authorization header (Bearer token)`);
+  console.log(`   Fallback: Legacy env vars supported for backward compatibility`);
   console.log(`🛠️  Tools: 4 (evaluate_diet, get_diet_recommendation, get_feed_info, search_feeds)`);
   console.log('=========================================');
   console.log('📝 Dairy cattle nutrition optimization');

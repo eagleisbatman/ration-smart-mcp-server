@@ -41,6 +41,7 @@ export interface DietRecommendationRequest {
   user_id: string;
   cattle_info: CattleInfo;
   feed_selection: FeedWithPrice[];
+  country_id?: string; // Optional - can be auto-detected from feeds
 }
 
 export interface DietEvaluationRequest {
@@ -296,7 +297,13 @@ export class FeedFormulationClient {
       throw new Error(`Failed to search feeds: ${response.status}`);
     }
     
-    return response.json() as Promise<FeedDetails[]>;
+    const data = await response.json();
+    // Handle paginated response format: {total, limit, offset, feeds: [...]}
+    // or direct array format for backward compatibility
+    if (data && typeof data === 'object' && 'feeds' in data) {
+      return data.feeds as FeedDetails[];
+    }
+    return data as FeedDetails[];
   }
 
   /**
@@ -305,18 +312,30 @@ export class FeedFormulationClient {
   async getDietRecommendation(
     cattleInfo: CattleInfo,
     feedSelection: FeedWithPrice[],
+    countryId?: string,
     userId?: string  // Optional for API key auth
   ): Promise<any> {
-    // For API key auth, we need a user_id - can be a service account or passed in
     let userIdToUse: string;
+    let countryIdToUse: string;
     
     if (this.apiKey) {
-      if (!userId) {
-        throw new Error('user_id is required when using API key authentication. Pass it as a parameter or use a service account user_id.');
+      // Auto-detect country_id from feeds if not provided
+      if (!countryId) {
+        const feedIds = feedSelection.map(f => f.feed_id);
+        const detectedCountryId = await this.detectCountryFromFeeds(feedIds);
+        if (!detectedCountryId) {
+          throw new Error('country_id is required. Either provide it explicitly or ensure feeds have country_id set.');
+        }
+        countryIdToUse = detectedCountryId;
+      } else {
+        countryIdToUse = countryId;
       }
-      userIdToUse = userId;
+      
+      // Use provided userId or service account
+      userIdToUse = userId || await this.getServiceAccountUserId();
     } else {
       userIdToUse = await this.getUserId();
+      countryIdToUse = countryId || await this.getCountryId();
     }
 
     const simulationId = `sim-${Date.now()}`;
@@ -325,7 +344,8 @@ export class FeedFormulationClient {
       simulation_id: simulationId,
       user_id: userIdToUse,
       cattle_info: cattleInfo,
-      feed_selection: feedSelection
+      feed_selection: feedSelection,
+      country_id: countryIdToUse // Include country_id if detected
     };
 
     const response = await fetch(`${this.baseUrl}/diet-recommendation-working/`, {
@@ -343,6 +363,31 @@ export class FeedFormulationClient {
   }
 
   /**
+   * Auto-detect country_id from feeds
+   */
+  private async detectCountryFromFeeds(feedIds: string[]): Promise<string | null> {
+    try {
+      // Fetch first feed to get country_id
+      if (feedIds.length === 0) return null;
+      const firstFeed = await this.getFeedById(feedIds[0]);
+      return firstFeed.fd_country_id || null;
+    } catch (error) {
+      console.warn('[FeedClient] Could not auto-detect country from feeds:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Get or create service account user_id for API key auth
+   */
+  private async getServiceAccountUserId(): Promise<string> {
+    // For API key auth, use a service account user_id
+    // This is a placeholder UUID that represents "API key organization user"
+    // In production, you might want to create actual service account users per organization
+    return '00000000-0000-0000-0000-000000000000'; // Service account UUID
+  }
+
+  /**
    * Evaluate diet
    */
   async evaluateDiet(
@@ -352,17 +397,25 @@ export class FeedFormulationClient {
     currency?: string,
     userId?: string  // Optional for API key auth
   ): Promise<any> {
-    // For API key auth, we need user_id and country_id
     let userIdToUse: string;
     let countryIdToUse: string;
     let currencyToUse: string;
 
     if (this.apiKey) {
-      if (!userId || !countryId) {
-        throw new Error('user_id and country_id are required when using API key authentication.');
+      // For API key auth, auto-detect country_id from feeds if not provided
+      if (!countryId) {
+        const feedIds = feedEvaluation.map(f => f.feed_id);
+        const detectedCountryId = await this.detectCountryFromFeeds(feedIds);
+        if (!detectedCountryId) {
+          throw new Error('country_id is required. Either provide it explicitly or ensure feeds have country_id set.');
+        }
+        countryIdToUse = detectedCountryId;
+      } else {
+        countryIdToUse = countryId;
       }
-      userIdToUse = userId;
-      countryIdToUse = countryId;
+      
+      // Use provided userId or service account
+      userIdToUse = userId || await this.getServiceAccountUserId();
       currencyToUse = currency || 'USD';
     } else {
       userIdToUse = await this.getUserId();
